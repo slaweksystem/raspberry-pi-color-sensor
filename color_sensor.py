@@ -1,7 +1,8 @@
 import RPi.GPIO as GPIO
 import time
-import zmq
-import json
+import zmq  # Re-adding ZeroMQ
+import json # Re-adding JSON
+import os   # For checking the IPC file
 
 # --- GPIO Pin Definitions (BCM Mode) ---
 # These pins are standard for Pi 3B and other 40-pin models
@@ -18,6 +19,9 @@ CAL_RED = 1.0
 CAL_GREEN = 1.0
 CAL_BLUE = 1.0
 
+# --- IPC File Path ---
+IPC_PATH = "ipc:///tmp/color_sensor.ipc"
+
 # --- 1. Hardware Setup Function ---
 def setup_gpio():
     """Initializes the Raspberry Pi's GPIO pins."""
@@ -32,6 +36,9 @@ def setup_gpio():
     
     # Setup input pin
     GPIO.setup(OUT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    # --- Edge detection removed for simplicity ---
+    print("[Init] Using simple polling mode (no edge detection).")
     
     # Set frequency scaling to 20%
     # (Good balance of speed and stability)
@@ -39,31 +46,63 @@ def setup_gpio():
     GPIO.output(S1, GPIO.LOW)
     print("[Init] GPIO setup complete.")
 
-# --- 2. Raw Sensor Reading Function ---
+# --- 2. ZeroMQ Setup Function ---
+def setup_zeromq():
+    """Initializes the ZeroMQ publisher socket using IPC."""
+    print("[Init] Setting up ZeroMQ Publisher...")
+    
+    # Clean up old IPC file if it exists
+    ipc_file = IPC_PATH.replace("ipc://", "")
+    if os.path.exists(ipc_file):
+        print(f"[Init] Removing stale IPC file: {ipc_file}")
+        os.remove(ipc_file)
+        
+    try:
+        context = zmq.Context()
+        publisher = context.socket(zmq.PUB)
+        # Bind to the IPC file path
+        publisher.bind(IPC_PATH)
+        print(f"[Init] ZMQ Publisher bound to {IPC_PATH}")
+        return context, publisher
+    except zmq.ZMQError as e:
+        print(f"[Init] CRITICAL: Failed to bind ZMQ socket: {e}")
+        print(f"[Init] Is another script already using the file {IPC_PATH}?")
+        print("[Init] Or check permissions for /tmp/ directory.")
+        raise
+
+# --- 3. Raw Sensor Reading Function (Simplified) ---
 def get_raw_frequency():
     """
-    Reads the raw frequency from the TCS3200 OUT pin.
-    This is a blocking function that samples for 0.1 seconds.
+    Reads the raw frequency from the TCS3200 OUT pin
+    by manually polling the pin in a loop.
+    This avoids GPIO.wait_for_edge() and event detection.
     """
+    sample_duration = 0.1 # Sample for 100ms
     pulse_count = 0
     start_time = time.time()
-    sample_duration = 0.1 # Sample for 100ms
+    
+    # Get the initial state of the pin
+    last_state = GPIO.input(OUT)
     
     while time.time() - start_time < sample_duration:
-        # Wait for the pin to go LOW
-        GPIO.wait_for_edge(OUT, GPIO.FALLING)
-        pulse_count += 1
-        
-    # Calculate frequency (pulses per second)
+        current_state = GPIO.input(OUT)
+        # Check for a falling edge (HIGH to LOW)
+        if last_state == GPIO.HIGH and current_state == GPIO.LOW:
+            pulse_count += 1
+        last_state = current_state
+
+    # Calculate frequency
     if pulse_count == 0:
-        return 0.0 # Avoid division by zero
-    
-    # We add 1 to pulse_count as a simple way to avoid division by zero
-    # and to account for the first pulse
-    frequency = pulse_count / sample_duration
+        return 0.0
+        
+    actual_duration = time.time() - start_time
+    if actual_duration == 0:
+        return 0.0
+        
+    frequency = pulse_count / actual_duration
     return frequency
 
-# --- 3. Calibration Function ---
+# --- 4. Calibration Function ---
 def calibrate_white_balance():
     """
     Guides the user to calibrate the sensor for white.
@@ -101,7 +140,7 @@ def calibrate_white_balance():
     print(f"  Blue Freq: {CAL_BLUE:.2f}")
     time.sleep(2)
 
-# --- 4. Calibrated Color Reading Function ---
+# --- 5. Calibrated Color Reading Function ---
 def read_calibrated_color():
     """Reads R, G, and B values and scales them based on calibration."""
     
@@ -139,7 +178,7 @@ def read_calibrated_color():
     
     return r, g, b
 
-# --- 5. Color Processing Logic (This is the function to edit!) ---
+# --- 6. Color Processing Logic (This is the function to edit!) ---
 def process_color_data(r, g, b):
     """
     Takes 0-255 RGB values and processes them.
@@ -178,55 +217,69 @@ def process_color_data(r, g, b):
         "g": g,
         "b": b,
         "hex": hex_val,
-        "dominant": dominant
+        "dominant": dominant,
+        "status": "ok" # Add status for the web UI
     }
     
     return data_packet
 
-# --- 6. Main Execution ---
+# --- 7. Main Execution (with ZMQ) ---
 def main():
-    """Main program loop."""
+    """Main program loop. Reads sensor and publishes data via ZMQ."""
     
-    setup_gpio()
-    calibrate_white_balance()
+    context = None
+    publisher = None
     
-    # --- ZMQ Publisher Setup ---
-    print("[Init] Setting up ZMQ Publisher...")
-    context = zmq.Context()
-    socket = context.socket(zmq.PUB)
-    # Connect to the address the server is BINDING to.
-    # If on the same Pi, 'localhost' is perfect.
-    socket.connect("tcp://localhost:5556")
-    print("[Init] ZMQ Publisher connected. Starting sensor loop.")
-    
-    while True:
-        # 1. Read the color from the sensor
-        r, g, b = read_calibrated_color()
-        
-        # 2. Process the data (get hex, dominant, etc.)
-        color_data = process_color_data(r, g, b)
-        
-        # 3. Convert data to a JSON string
-        message = json.dumps(color_data)
-        
-        # 4. Publish the message
-        socket.send_string(message)
-        
-        # 5. Print to console for local debugging
-        print(f"Sent: R={r}, G={g}, B={b}, Hex={color_data['hex']}, Dom={color_data['dominant']}")
-        
-        # 6. Wait a bit before the next reading
-        time.sleep(0.5) # Send data twice per second
-
-if __name__ == '__main__':
     try:
-        main()
+        setup_gpio()
+        context, publisher = setup_zeromq()
+        calibrate_white_balance()
+        
+        print("\n--- Starting Sensor Reading and Publishing ---")
+        print("Press Ctrl+C to stop.")
+        
+        while True:
+            # 1. Read the color from the sensor
+            r, g, b = read_calibrated_color()
+            
+            # 2. Process the data (get hex, dominant, etc.)
+            color_data = process_color_data(r, g, b)
+            
+            # 3. Convert data packet to JSON string
+            message = json.dumps(color_data)
+            
+            # 4. Publish the message
+            publisher.send_string(message)
+            
+            # 5. Print to console (so we know it's working)
+            print(f"Published: R={r}, G={g}, B={b}, Hex={color_data['hex']}, Dominant={color_data['dominant']}")
+            
+            # 6. Wait a bit before the next reading
+            time.sleep(0.1)
+
     except KeyboardInterrupt:
         # Gracefully exit on Ctrl+C
         print("\nStopping application.")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
-        # This ALWAYS runs, ensuring pins are reset
+        # This ALWAYS runs, ensuring pins and sockets are closed
+        if publisher:
+            publisher.close()
+            print("ZMQ Publisher closed.")
+        if context:
+            context.term()
+            print("ZMQ Context terminated.")
+            
+        # Clean up the IPC file on exit
+        ipc_file = IPC_PATH.replace("ipc://", "")
+        if os.path.exists(ipc_file):
+            print(f"[Cleanup] Removing IPC file: {ipc_file}")
+            os.remove(ipc_file)
+            
         GPIO.cleanup()
         print("GPIO cleaned up. Exiting.")
+
+if __name__ == '__main__':
+    main()
+
